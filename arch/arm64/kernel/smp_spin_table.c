@@ -27,7 +27,11 @@
 #include <asm/cpu_ops.h>
 #include <asm/cputype.h>
 #include <asm/io.h>
+#include <asm/kexec.h>
+#include <asm/mmu_context.h>
 #include <asm/smp_plat.h>
+
+#include "cpu-park.h"
 
 extern void secondary_holding_pen(void);
 volatile unsigned long __section(".mmuoff.data.read")
@@ -76,10 +80,15 @@ static int smp_spin_table_cpu_init(unsigned int cpu)
 
 static int smp_spin_table_cpu_prepare(unsigned int cpu)
 {
-	__le64 __iomem *release_addr;
-
 	if (!cpu_release_addr[cpu])
 		return -ENODEV;
+
+	return 0;
+}
+
+static int smp_spin_table_cpu_boot(unsigned int cpu)
+{
+	__le64 __iomem *release_addr;
 
 	/*
 	 * The cpu-release-addr may or may not be inside the linear mapping.
@@ -110,11 +119,6 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
 
 	iounmap(release_addr);
 
-	return 0;
-}
-
-static int smp_spin_table_cpu_boot(unsigned int cpu)
-{
 	/*
 	 * Update the pen release flag.
 	 */
@@ -128,9 +132,37 @@ static int smp_spin_table_cpu_boot(unsigned int cpu)
 	return 0;
 }
 
+#ifdef CONFIG_HOTPLUG_CPU
+static int smp_spin_table_cpu_disable(unsigned int cpu)
+{
+	if (!cpu_release_addr[cpu])
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
+static void smp_spin_table_cpu_die(unsigned int cpu)
+{
+	cpu_install_idmap();
+#ifdef CONFIG_CRASH_DUMP
+	cpu_park(kexec_crash_loaded() ? 0 : is_hyp_mode_available(),
+			cpu_release_addr[cpu]);
+#else
+	cpu_park(is_hyp_mode_available(),
+			cpu_release_addr[cpu]);
+#endif
+
+	pr_crit("unable to power off CPU%u\n", cpu);
+}
+#endif
+
 const struct cpu_operations smp_spin_table_ops = {
 	.name		= "spin-table",
 	.cpu_init	= smp_spin_table_cpu_init,
 	.cpu_prepare	= smp_spin_table_cpu_prepare,
 	.cpu_boot	= smp_spin_table_cpu_boot,
+#ifdef CONFIG_HOTPLUG_CPU
+	.cpu_disable	= smp_spin_table_cpu_disable,
+	.cpu_die	= smp_spin_table_cpu_die,
+#endif
 };
