@@ -62,7 +62,19 @@ el1_sync:
 	msr	vbar_el2, x0			// Set vbar_el2
 	b	2f
 1:	mrs	x0, vbar_el2			// Return vbar_el2
-2:	eret
+
+2:	cmp	x0, #HVC_SOFT_RESTART
+	b.ne	3f
+	mov	x0, x2
+	mov	x2, x4
+	mov	x4, x1
+	mov	x1, x3
+	br	x4				// no return
+
+	/* Someone called kvm_call_hyp() against the hyp-stub... */
+3:	mov	x0, #ARM_EXCEPTION_HYP_GONE
+
+9:	eret
 ENDPROC(el1_sync)
 
 .macro invalid_vector	label
