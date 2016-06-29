@@ -130,7 +130,8 @@ static void split_pud(pud_t *old_pud, pmd_t *pmd)
 static void alloc_init_pmd(struct mm_struct *mm, pud_t *pud,
 				  unsigned long addr, unsigned long end,
 				  phys_addr_t phys, pgprot_t prot,
-				  void *(*alloc)(unsigned long size))
+				  void *(*alloc)(unsigned long size),
+				  bool allow_block_mappings)
 {
 	pmd_t *pmd;
 	unsigned long next;
@@ -156,7 +157,8 @@ static void alloc_init_pmd(struct mm_struct *mm, pud_t *pud,
 	do {
 		next = pmd_addr_end(addr, end);
 		/* try section mapping first */
-		if (((addr | next | phys) & ~SECTION_MASK) == 0) {
+		if (((addr | next | phys) & ~SECTION_MASK) == 0 &&
+		      allow_block_mappings) {
 			pmd_t old_pmd =*pmd;
 			set_pmd(pmd, __pmd(phys |
 					   pgprot_val(mk_sect_prot(prot))));
@@ -195,7 +197,8 @@ static inline bool use_1G_block(unsigned long addr, unsigned long next,
 static void alloc_init_pud(struct mm_struct *mm, pgd_t *pgd,
 				  unsigned long addr, unsigned long end,
 				  phys_addr_t phys, pgprot_t prot,
-				  void *(*alloc)(unsigned long size))
+				  void *(*alloc)(unsigned long size),
+				  bool allow_block_mappings)
 {
 	pud_t *pud;
 	unsigned long next;
@@ -213,7 +216,7 @@ static void alloc_init_pud(struct mm_struct *mm, pgd_t *pgd,
 		/*
 		 * For 4K granule only, attempt to put down a 1GB block
 		 */
-		if (use_1G_block(addr, next, phys)) {
+		if (use_1G_block(addr, next, phys) && allow_block_mappings) {
 			pud_t old_pud = *pud;
 			set_pud(pud, __pud(phys |
 					   pgprot_val(mk_sect_prot(prot))));
@@ -234,7 +237,8 @@ static void alloc_init_pud(struct mm_struct *mm, pgd_t *pgd,
 				}
 			}
 		} else {
-			alloc_init_pmd(mm, pud, addr, next, phys, prot, alloc);
+			alloc_init_pmd(mm, pud, addr, next, phys, prot, alloc,
+                                       allow_block_mappings);
 		}
 		phys += next - addr;
 	} while (pud++, addr = next, addr != end);
@@ -247,7 +251,8 @@ static void alloc_init_pud(struct mm_struct *mm, pgd_t *pgd,
 static void  __create_mapping(struct mm_struct *mm, pgd_t *pgd,
 				    phys_addr_t phys, unsigned long virt,
 				    phys_addr_t size, pgprot_t prot,
-				    void *(*alloc)(unsigned long size))
+				    void *(*alloc)(unsigned long size),
+				    bool allow_block_mappings)
 {
 	unsigned long addr, length, end, next;
 
@@ -265,7 +270,8 @@ static void  __create_mapping(struct mm_struct *mm, pgd_t *pgd,
 	end = addr + length;
 	do {
 		next = pgd_addr_end(addr, end);
-		alloc_init_pud(mm, pgd, addr, next, phys, prot, alloc);
+		alloc_init_pud(mm, pgd, addr, next, phys, prot, alloc,
+			       allow_block_mappings);
 		phys += next - addr;
 	} while (pgd++, addr = next, addr != end);
 }
@@ -289,15 +295,15 @@ static void __init create_mapping(phys_addr_t phys, unsigned long virt,
 		return;
 	}
 	__create_mapping(&init_mm, pgd_offset_k(virt), phys, virt,
-			 size, prot, early_alloc);
+			 size, prot, early_alloc, !debug_pagealloc_enabled());
 }
 
 void __init create_pgd_mapping(struct mm_struct *mm, phys_addr_t phys,
 			       unsigned long virt, phys_addr_t size,
-			       pgprot_t prot)
+			       pgprot_t prot, bool allow_block_mappings)
 {
 	__create_mapping(mm, pgd_offset(mm, virt), phys, virt, size, prot,
-				late_alloc);
+			     late_alloc, allow_block_mappings);
 }
 
 static void create_mapping_late(phys_addr_t phys, unsigned long virt,
@@ -310,7 +316,7 @@ static void create_mapping_late(phys_addr_t phys, unsigned long virt,
 	}
 
 	return __create_mapping(&init_mm, pgd_offset_k(virt),
-				phys, virt, size, prot, late_alloc);
+				phys, virt, size, prot, late_alloc, !debug_pagealloc_enabled());
 }
 
 #ifdef CONFIG_DEBUG_RODATA
@@ -437,7 +443,6 @@ void mark_rodata_ro(void)
 	create_mapping_late(__pa(_stext), (unsigned long)_stext,
 				(unsigned long)_etext - (unsigned long)_stext,
 				PAGE_KERNEL_ROX);
-
 }
 #endif
 
