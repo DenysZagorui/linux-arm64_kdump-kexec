@@ -21,6 +21,8 @@
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/init.h>
+#include <linux/ioport.h>
+#include <linux/kexec.h>
 #include <linux/libfdt.h>
 #include <linux/mman.h>
 #include <linux/nodemask.h>
@@ -287,7 +289,7 @@ static void *late_alloc(unsigned long size)
 }
 
 static void __init create_mapping(phys_addr_t phys, unsigned long virt,
-				  phys_addr_t size, pgprot_t prot)
+				  phys_addr_t size, pgprot_t prot, bool allow_block_mapping)
 {
 	if (virt < VMALLOC_START) {
 		pr_warn("BUG: not creating mapping for %pa at 0x%016lx - outside kernel range\n",
@@ -295,7 +297,7 @@ static void __init create_mapping(phys_addr_t phys, unsigned long virt,
 		return;
 	}
 	__create_mapping(&init_mm, pgd_offset_k(virt), phys, virt,
-			 size, prot, early_alloc, !debug_pagealloc_enabled());
+			 size, prot, early_alloc, allow_block_mapping);
 }
 
 void __init create_pgd_mapping(struct mm_struct *mm, phys_addr_t phys,
@@ -320,7 +322,7 @@ static void create_mapping_late(phys_addr_t phys, unsigned long virt,
 }
 
 #ifdef CONFIG_DEBUG_RODATA
-static void __init __map_memblock(phys_addr_t start, phys_addr_t end)
+static void __init __map_memblock(phys_addr_t start, phys_addr_t end, bool allow_block_mapping)
 {
 	/*
 	 * Set up the executable regions using the existing section mappings
@@ -332,32 +334,32 @@ static void __init __map_memblock(phys_addr_t start, phys_addr_t end)
 
 	if (end < kernel_x_start) {
 		create_mapping(start, __phys_to_virt(start),
-			end - start, PAGE_KERNEL);
+			end - start, PAGE_KERNEL, allow_block_mapping);
 	} else if (start >= kernel_x_end) {
 		create_mapping(start, __phys_to_virt(start),
-			end - start, PAGE_KERNEL);
+			end - start, PAGE_KERNEL, allow_block_mapping);
 	} else {
 		if (start < kernel_x_start)
 			create_mapping(start, __phys_to_virt(start),
 				kernel_x_start - start,
-				PAGE_KERNEL);
+				PAGE_KERNEL, allow_block_mapping);
 		create_mapping(kernel_x_start,
 				__phys_to_virt(kernel_x_start),
 				kernel_x_end - kernel_x_start,
-				PAGE_KERNEL_EXEC);
+				PAGE_KERNEL_EXEC, allow_block_mapping);
 		if (kernel_x_end < end)
 			create_mapping(kernel_x_end,
 				__phys_to_virt(kernel_x_end),
 				end - kernel_x_end,
-				PAGE_KERNEL);
+				PAGE_KERNEL, allow_block_mapping);
 	}
 
 }
 #else
-static void __init __map_memblock(phys_addr_t start, phys_addr_t end)
+static void __init __map_memblock(phys_addr_t start, phys_addr_t end, bool allow_block_mapping)
 {
 	create_mapping(start, __phys_to_virt(start), end - start,
-			PAGE_KERNEL_EXEC);
+			PAGE_KERNEL_EXEC, allow_block_mapping);
 }
 #endif
 
@@ -365,6 +367,7 @@ static void __init map_mem(void)
 {
 	struct memblock_region *reg;
 	phys_addr_t limit;
+	int allow_block_mapping = !debug_pagealloc_enabled();
 
 	/*
 	 * Temporarily limit the memblock range. We need to do this as
@@ -378,6 +381,12 @@ static void __init map_mem(void)
 	 */
 	limit = PHYS_OFFSET + SWAPPER_INIT_MAP_SIZE;
 	memblock_set_current_limit(limit);
+
+#ifdef CONFIG_KEXEC_CORE
+	if (crashk_res.end)
+		memblock_mark_nomap(crashk_res.start,
+				    resource_size(&crashk_res));
+#endif
 
 	/* map all the memory banks */
 	for_each_memblock(memory, reg) {
@@ -407,8 +416,21 @@ static void __init map_mem(void)
 				memblock_set_current_limit(limit);
 			}
 		}
-		__map_memblock(start, end);
+		__map_memblock(start, end, allow_block_mapping);
 	}
+
+#ifdef CONFIG_KEXEC_CORE
+	/*
+	 * Use page-level mappings here so that we can shrink the region
+	 * in page granularity and put back unused memory to buddy system
+	 * through /sys/kernel/kexec_crash_size interface.
+	 */
+	if (crashk_res.end) {
+		__map_memblock(crashk_res.start, crashk_res.end + 1, false);
+		memblock_clear_nomap(crashk_res.start,
+				     resource_size(&crashk_res));
+	}
+#endif
 
 	/* Limit no longer required. */
 	memblock_set_current_limit(MEMBLOCK_ALLOC_ANYWHERE);
@@ -424,7 +446,7 @@ static void __init fixup_executable(void)
 
 		create_mapping(aligned_start, __phys_to_virt(aligned_start),
 				__pa(_stext) - aligned_start,
-				PAGE_KERNEL);
+				PAGE_KERNEL, !debug_pagealloc_enabled());
 	}
 
 	if (!IS_ALIGNED((unsigned long)__init_end, SWAPPER_BLOCK_SIZE)) {
@@ -432,7 +454,7 @@ static void __init fixup_executable(void)
 							  SWAPPER_BLOCK_SIZE);
 		create_mapping(__pa(__init_end), (unsigned long)__init_end,
 				aligned_end - __pa(__init_end),
-				PAGE_KERNEL);
+				PAGE_KERNEL, !debug_pagealloc_enabled());
 	}
 #endif
 }
@@ -693,7 +715,7 @@ void *__init fixmap_remap_fdt(phys_addr_t dt_phys)
 
 	/* map the first chunk so we can read the size from the header */
 	create_mapping(round_down(dt_phys, SWAPPER_BLOCK_SIZE), dt_virt_base,
-		       SWAPPER_BLOCK_SIZE, prot);
+		       SWAPPER_BLOCK_SIZE, prot, !debug_pagealloc_enabled());
 
 	if (fdt_magic(dt_virt) != FDT_MAGIC)
 		return NULL;
@@ -704,7 +726,7 @@ void *__init fixmap_remap_fdt(phys_addr_t dt_phys)
 
 	if (offset + size > SWAPPER_BLOCK_SIZE)
 		create_mapping(round_down(dt_phys, SWAPPER_BLOCK_SIZE), dt_virt_base,
-			       round_up(offset + size, SWAPPER_BLOCK_SIZE), prot);
+			       round_up(offset + size, SWAPPER_BLOCK_SIZE), prot, !debug_pagealloc_enabled());
 
 	memblock_reserve(dt_phys, size);
 
